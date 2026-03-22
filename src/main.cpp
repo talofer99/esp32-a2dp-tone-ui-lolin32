@@ -11,10 +11,12 @@
 #include <esp_wifi.h>
 #include <esp_gap_bt_api.h>
 #include <nvs_flash.h>
-#include "test_audio.h"  // PCM test samples — regenerate with: python tools/make_test_audio.py
 
 // ---- Firmware version ----
-static const char *kFwVersion = "1.0.10";
+static const char *kFwVersion = "1.0.11";
+
+// Uncomment to enable periodic ADC/A2DP stats on serial (every 2s)
+// #define DEBUG_STATS
 
 // ---- Constants ----
 static const char *kApSsid     = "ESP32-Audio-Setup";
@@ -58,7 +60,6 @@ String lastBtState      = "idle";
 volatile int audioVolume = 80;
 bool   adcEnabled       = false;  // tracks whether i2s_adc_enable() has been called
 static esp_adc_cal_characteristics_t adcChars;  // calibration data loaded in setupADC()
-bool   testToneMode     = false;  // false = ADC input (default); true = embedded test audio
 
 int  reconnectStepIdx = 0;
 bool reconnectPending = false;
@@ -173,8 +174,10 @@ void adcTask(void *) {
         stereoActive = true;
         Serial.println("[ADC] Stereo confirmed — CH7 (GPIO35) active");
       }
+#ifdef DEBUG_STATS
       Serial.printf("[v%s][ADC] L: %u/sec  R: %u/sec  reads: %u/sec  ringL: %d  ringR: %d  stereo: %s\n",
                     kFwVersion, lRate, rRate, readCount / 2, ringAvail(), ringRAvail(), stereoActive ? "yes" : "no");
+#endif
       fillLCount = 0; fillRCount = 0; readCount = 0; fillTick = now;
     }
   }
@@ -188,18 +191,6 @@ void adcTask(void *) {
 int32_t getDataFrames(Frame *frame, int32_t frame_count) {
   int vol = audioVolume;
   bool active = toneEnabled && btConnected;
-
-  // ---- Test mode: play embedded PCM samples (looped) ----
-  if (active && testToneMode) {
-    static int32_t audioPos = 0;
-    for (int i = 0; i < frame_count; i++) {
-      int16_t s = (int16_t)((int32_t)kTestAudio[audioPos % kTestAudioLen] * vol / 100);
-      frame[i].channel1 = s;
-      frame[i].channel2 = s;
-      audioPos++;
-    }
-    return frame_count;
-  }
 
   // ---- ADC mode: stereo, single interleaved ring ----
   // Ring fills at ~22080 pairs/sec (L,R,L,R interleaved from adcTask pairing).
@@ -261,10 +252,12 @@ int32_t getDataFrames(Frame *frame, int32_t frame_count) {
     if (kRatio > 1.20f) kRatio = 1.20f;
     if (kRatio < 0.40f) kRatio = 0.40f;
 
+#ifdef DEBUG_STATS
     Serial.printf("[A2DP] drain: %u/sec  calls: %u/sec  avg: %u  ring: %d  ratio: %.4f  act=%d\n",
                   drainCount / 2, callCount / 2,
                   callCount ? drainCount / callCount : 0, ringAvail(),
                   kRatio, (int)active);
+#endif
     if (callCount > 0) {
       static int dh5Streak = 0;
       uint32_t callsPerSec = callCount / 2;
@@ -340,7 +333,7 @@ void connectionStateChanged(esp_a2d_connection_state_t state, void *ptr) {
     Serial.printf("[BT] set_acl_pkt_types → %s\n", esp_err_to_name(pkt_err));
 
     toneEnabled = true;
-    if (!testToneMode) enableADC();
+    enableADC();
     Serial.println("[Audio] streaming enabled, WiFi stopped");
   } else if (state == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
     toneEnabled = false;
@@ -444,8 +437,6 @@ String renderPage() {
   page += F("<button onclick=\"fetch('/tone/off')\">Stop audio</button>");
   page += F("<hr style='margin:12px 0'>");
   page += F("<p class='muted' style='margin:0 0 8px'><b>Test audio</b> (embedded PCM chord, no ADC) — use to verify BT quality. WiFi stays up.<br><b>ADC input</b> — switches to live analog input. WiFi stops to reduce interference.</p>");
-  page += F("<button onclick=\"fetch('/testtone/on')\">&#9654; Switch to Test audio</button>");
-  page += F("<button onclick=\"fetch('/testtone/off')\">&#127908; Switch to ADC input</button>");
   page += F("</div>");
 
   page += F("<div class='card'><h3>3) Volume</h3>");
@@ -539,12 +530,6 @@ void handleFullReset() {
 
 void handleToneOn()  { toneEnabled = true;  server.send(200, "text/plain", "ok"); }
 void handleToneOff() { toneEnabled = false; server.send(200, "text/plain", "ok"); }
-void handleTestToneOn()  { testToneMode = true;  server.send(200, "text/plain", "ok"); }
-void handleTestToneOff() {
-  testToneMode = false;
-  if (btConnected) enableADC();  // switching to ADC mode — enable I2S ADC
-  server.send(200, "text/plain", "ok");
-}
 
 void handleVolume() {
   if (server.hasArg("level")) {
@@ -606,8 +591,6 @@ void setupWeb() {
   server.on("/fullreset",    HTTP_GET, handleFullReset);
   server.on("/tone/on",      HTTP_GET, handleToneOn);
   server.on("/tone/off",     HTTP_GET, handleToneOff);
-  server.on("/testtone/on",  HTTP_GET, handleTestToneOn);
-  server.on("/testtone/off", HTTP_GET, handleTestToneOff);
   server.on("/volume",       HTTP_GET, handleVolume);
   server.on("/status",       HTTP_GET, handleStatus);
 
