@@ -1,41 +1,66 @@
-# ESP32 A2DP Tone Tester for WEMOS LOLIN32
+# ESP32 A2DP Stereo Audio Transmitter
 
-This is a Phase 1 proof-of-concept project for your Bluetooth-audio-transmitter idea.
+Bluetooth A2DP audio transmitter running on a WEMOS LOLIN32 (original ESP32).
+Reads **stereo RCA analog input** via ADC and streams to Bluetooth headsets/speakers.
 
-What it does:
-- creates a Wi-Fi access point
-- serves a tiny web UI
-- lets you enter the exact Bluetooth headset name
-- starts the ESP32 as an A2DP source
-- plays a built-in sine-wave test tone after the headset connects
+Wi-Fi AP web UI for device connection and control — no app needed.
 
-What it does **not** do yet:
-- no RCA / analog input yet
-- no device scan list yet
-- no reconnect manager yet
-- changing to a different headset is easiest by rebooting
+## Features
 
-## Board
-This project is configured for:
-- `board = lolin32`
+- Stereo ADC input: GPIO34 (Left) + GPIO35 (Right)
+- A2DP source streaming to any Bluetooth Classic headset/speaker
+- Phase-accumulator resampler with adaptive ratio
+- eFuse ADC calibration for linearity correction
+- Auto-reconnect to last paired device on boot
+- Volume control via web UI (persisted to NVS)
+- "Forget device" button to clear BT pairing
+- Debug stats toggle (`#define DEBUG_STATS` in main.cpp)
+
+## Hardware
+
+| Item | Detail |
+|------|--------|
+| Board | WEMOS LOLIN32 (original ESP32 with Bluetooth Classic) |
+| Left input | GPIO34 (ADC1_CH6) |
+| Right input | GPIO35 (ADC1_CH7) |
+| Bias circuit | 2×100K divider (3.3V→GPIO→GND) + 22µF coupling cap + 10K series resistor |
+| Filter caps | 1nF ceramic low-pass + 10µF electrolytic bias bypass per channel |
+
+**Note:** Must be original ESP32 — ESP32-S3 has no Bluetooth Classic.
+
+See [docs/PROGRESS.md](docs/PROGRESS.md) for full circuit schematic.
 
 ## Build / Upload
-Open the folder in VS Code with PlatformIO and use the `lolin32` environment.
 
-## Wi-Fi UI
-After boot:
-1. Join Wi-Fi network: `ESP32-Audio-Setup`
-2. Password: `esp32audio`
-3. Open: `http://192.168.4.1`
-4. Put your headset in pairing mode
-5. Enter the exact Bluetooth device name
-6. Click **Connect**
-7. Click **Play tone** once connected
+PlatformIO project — open in VS Code with PlatformIO extension.
 
-## Notes
-- This requires an original ESP32 board with Bluetooth Classic support.
-- Your earlier ESP32-S3 idea would not be suitable for A2DP Classic output.
-- The A2DP library version is pinned in `platformio.ini` for stability.
+```
+pio run -t upload --upload-port COMx
+```
 
-## Next Step
-Once this works, the next iteration is to replace the tone generator with an analog capture pipeline.
+## Usage
+
+1. Join Wi-Fi: **ESP32-Audio-Setup** / password **esp32audio**
+2. Browse to **http://192.168.4.1**
+3. Put headset in pairing mode
+4. Enter exact Bluetooth device name → click **Connect**
+5. Audio streams automatically once connected
+
+## Architecture
+
+- All application logic in `src/main.cpp`
+- Two concurrent contexts: Arduino `loop()` (HTTP server) + A2DP FreeRTOS task (audio callback)
+- Audio path: I2S ADC DMA → ring buffer → stereo resampler → A2DP Bluetooth stack
+- Persistent storage: `Preferences` library (device name + volume)
+
+## Serial Monitor
+
+```
+python tools/monitor.py COMx 115200
+```
+
+Output logged to `docs/logs/live.log`. Enable `#define DEBUG_STATS` in main.cpp for periodic ADC/A2DP stats.
+
+## Roadmap
+
+See [docs/ROADMAP.md](docs/ROADMAP.md) for planned features.

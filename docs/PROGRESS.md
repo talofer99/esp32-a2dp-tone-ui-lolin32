@@ -229,38 +229,18 @@ RCA shield → GND
 
 ## Current Status
 
-**Firmware:** v1.0.10 (flashed and confirmed running on COM6)
-**BT:** DH3 — 346 calls/sec ✅ (fixed via esp_bt_sleep_disable)
+**Firmware:** v1.0.11 (flashed and running on COM6 — soldered board)
+**BT:** 346 calls/sec ✅ (fixed via `esp_bt_sleep_disable`)
 **ADC:** L:22080/sec R:22080/sec stereo:yes (SYSCON CH6+CH7 alternating) ✅
-**Resampler:** ratio 0.5151 stable, ring 769–1149 ✅
-**Audio quality:** "Much better" — music clear, singer intelligible, no gaps, no breaks, no speed wobble, no edge crackling.
-**Remaining issue:** Low-level background noise audible between tracks (ESP32 ADC noise floor ~30–50mV, no gate applied).
+**Resampler:** ratio ~0.50 stable, ring ~1000 ✅
+**Audio quality:** Good — music clear, no gaps, no speed wobble. Low-level background noise between tracks (ESP32 ADC floor).
+**Cleanup:** Test tone removed, debug stats behind `#define DEBUG_STATS`
 
-### What the numbers look like (167/sec — BAD):
+### What the numbers look like (enable `DEBUG_STATS` to see):
 ```
-[A2DP] drain: 22080/sec  calls: 167/sec  avg: 131  ring: 3963
-[ADC]  fill: 44160/sec   reads: 172/sec  avg bytes/read: 512  ring: 4095
+[A2DP] drain: 44288/sec  calls: 346/sec  avg: 128  ring: ~1100  ratio: 0.4990
+[ADC]  L: 22080/sec  R: 22080/sec  reads: 172/sec  ringL: ~1000  stereo: yes
 ```
-
-### What the numbers look like (335/sec — GOOD):
-```
-[A2DP] drain: 44160/sec  calls: 335/sec  avg: 131  ring: ~2000
-[ADC]  fill: 44160/sec   reads: 172/sec  avg bytes/read: 512  ring: ~2000
-```
-
----
-
-## Next Steps
-
-1. **Flash and reconnect** — check if calls: 335/sec appears in log
-2. **If 335/sec restored:** Fix the 7-8s periodic gaps
-   - Increase RING_SIZE from 4096 to 8192 (more buffer against brief BT stutters)
-   - Investigate if gap correlates with WiFi stop/start or BT heartbeat
-3. **If still 167/sec after packet type fix:**
-   - Try completely different approach: reduce I2S fill rate to match 167/sec drain rate
-   - `kI2SConfigRate` = ~26000 Hz (→ actual 21,320 Hz fill), `kResampleRatio` = 1.003
-   - Declare 44100 Hz to headset — audio tempo will be wrong; need to also change declared sample rate
-   - OR: accept lower quality by declaring 16000 Hz SBC (within DH5 capacity)
 
 ---
 
@@ -270,11 +250,11 @@ RCA shield → GND
 | `src/main.cpp` | All application logic |
 | `.pio/libdeps/lolin32/ESP32-A2DP/src/BluetoothA2DPSource.cpp` | BT library (modified) |
 | `tools/monitor.py` | Serial monitor → `docs/logs/live.log` |
-| `docs/logs/live.log` | Live serial output log |
-| `PROGRESS.md` | This file |
+| `docs/ROADMAP.md` | Planned features and backlog |
+| `docs/PROGRESS.md` | This file |
 
 ## How to Start Monitor
 ```
-python tools/monitor.py COM7 115200
+python tools/monitor.py COM6 115200
 ```
 Check `docs/logs/live.log` for output.
