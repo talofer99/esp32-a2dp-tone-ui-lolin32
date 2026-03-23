@@ -54,6 +54,7 @@
 
 ### Housekeeping
 
+- [ ] **Split main.cpp into modules** — separate into logical files: BT/A2DP, ADC/audio, web server/AP, core logic. Currently everything is in one 600+ line file.
 - [ ] Silence legacy I2S/ADC deprecation warnings in build output
 - [ ] Add OTA update support (requires switching from `huge_app` to a dual-OTA partition table)
 
