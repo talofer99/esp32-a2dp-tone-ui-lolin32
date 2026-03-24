@@ -1,0 +1,13 @@
+# Normalize all text files to LF in repo, checkout as OS-native (CRLF on Windows)
+* text=auto
+
+# Force LF for these (cross-platform scripts, configs)
+*.cpp text eol=lf
+*.h text eol=lf
+*.ini text eol=lf
+*.py text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.csv text eol=lf
+*.gitignore text eol=lf
+*.gitattributes text eol=lf
