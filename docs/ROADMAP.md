@@ -28,6 +28,10 @@
 
 ## Backlog / TODO
 
+### Bugs
+
+- [ ] **WiFi AP not starting on boot failure** — when all BT connection attempts fail on boot (3 MAC + 2 name), the fallback WiFi AP does not start. Device becomes unreachable. Must be power-cycled. Worked before v1.0.15 split.
+
 ### Priority — Next up
 
 - [x] **LED state indication** — onboard LED (GPIO5): breathing=AP mode, slow blink=connecting, solid=streaming, rapid blink=disconnect/failure alert (v1.0.13)
@@ -57,7 +61,7 @@
 
 ### Housekeeping
 
-- [ ] **Split main.cpp into modules** — separate into logical files: BT/A2DP, ADC/audio, web server/AP, core logic. Currently everything is in one 600+ line file.
+- [x] **Split main.cpp into modules** — split into config.h, ring_buffer.h, audio, bluetooth, web_ui, led modules + slim main.cpp (v1.0.15)
 - [ ] Add OTA update support (requires switching from `huge_app` to a dual-OTA partition table)
 
 ---
