@@ -47,7 +47,7 @@
 
 ### Audio quality
 
-- [ ] **Evaluate new IDF I2S/ADC API** — current code uses legacy `driver/i2s.h` (deprecated in IDF 5.x); migrate to `esp_adc/adc_continuous.h` if quality issues persist
+- [x] **Migrate to new IDF ADC API** — replaced legacy `driver/i2s.h` with `esp_adc/adc_continuous.h`. No more SYSCON hacks, native multi-channel scan. Same ~82% efficiency compensation. Sound quality equal or better (v1.0.14)
 - [ ] **Input gain stage** — optional op-amp (e.g. MCP6002) if line-level signal is too weak
 
 ### Hardware / phase 2

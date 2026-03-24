@@ -302,6 +302,25 @@ RCA shield → GND
 
 ---
 
+## Step 39 — Migrate to adc_continuous API (v1.0.14) ✅ CONFIRMED
+
+**Goal:** Replace legacy `driver/i2s.h` ADC built-in mode with new `esp_adc/adc_continuous.h` API.
+
+**What changed:**
+- Replaced `i2s_driver_install()` + `i2s_set_adc_mode()` + `i2s_adc_enable()` → `adc_continuous_new_handle()` + `adc_continuous_config()` + `adc_continuous_start()`
+- Replaced `i2s_read()` → `adc_continuous_read()` with `adc_digi_output_data_t` parsing
+- Replaced SYSCON register hacks for stereo → native 2-channel scan pattern (CH6, CH7)
+- Replaced `esp_adc_cal_characterize()` + `esp_adc_cal_raw_to_voltage()` → `adc_cali_create_scheme_line_fitting()` + `adc_cali_raw_to_voltage()`
+- Removed includes: `driver/i2s.h`, `driver/adc.h`, `esp_adc_cal.h`, `soc/syscon_struct.h`
+- Added includes: `esp_adc/adc_continuous.h`, `esp_adc/adc_cali.h`, `esp_adc/adc_cali_scheme.h`
+
+**Key finding:** Same ~82% efficiency as legacy I2S ADC. Config rate 53,878 Hz → actual 44,160 Hz total → 22,080/sec per channel. Needed same oversampling compensation.
+
+**Result:** Sound quality equal or better than legacy API. All deprecation warnings eliminated. No more SYSCON register tricks. User confirmed: "sound is great, might be even better than before!"
+**Version:** v1.0.14
+
+---
+
 ## How to Start Monitor
 ```
 python tools/monitor.py COM6 115200

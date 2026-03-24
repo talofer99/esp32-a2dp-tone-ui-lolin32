@@ -4,16 +4,15 @@
 #include <DNSServer.h>
 #include <Preferences.h>
 #include <BluetoothA2DPSource.h>
-#include <driver/i2s.h>
-#include <driver/adc.h>
-#include <esp_adc_cal.h>
-#include "soc/syscon_struct.h"
+#include <esp_adc/adc_continuous.h>
+#include <esp_adc/adc_cali.h>
+#include <esp_adc/adc_cali_scheme.h>
 #include <esp_wifi.h>
 #include <esp_gap_bt_api.h>
 #include <nvs_flash.h>
 
 // ---- Firmware version ----
-static const char *kFwVersion = "1.0.13";
+static const char *kFwVersion = "1.0.14";
 
 // Uncomment to enable periodic ADC/A2DP stats on serial (every 2s)
 // #define DEBUG_STATS
@@ -22,13 +21,12 @@ static const char *kFwVersion = "1.0.13";
 static const char *kApSsid     = "ESP32-Audio-Setup";
 static const char *kApPassword = "esp32audio";
 static const uint32_t kSampleRate = 44100;
-// I2S ADC built-in mode runs at ~82% of the configured rate (36,096 Hz at 44,100 config).
-// Configure at 44,100 / 0.8185 ≈ 53,878 Hz so the hardware delivers ~44,100 Hz actual.
-// This corrects the 1.22x pitch shift and keeps fill > drain (no ring underruns).
-static const uint32_t kI2SConfigRate = 53878;
-static const adc1_channel_t kAdcChannelL = ADC1_CHANNEL_6;  // GPIO34 — left
-static const adc1_channel_t kAdcChannelR = ADC1_CHANNEL_7;  // GPIO35 — right
-static const i2s_port_t kI2SPort        = I2S_NUM_0;
+// adc_continuous sample rate: total conversions/sec across both channels
+// ESP32 ADC has ~82% efficiency (same as legacy I2S ADC mode).
+// 53878 configured → ~44,160 actual → ~22,080/sec per channel
+static const uint32_t kAdcSampleRate = 53878;
+static const int kAdcChannelL = ADC_CHANNEL_6;  // GPIO34 — left
+static const int kAdcChannelR = ADC_CHANNEL_7;  // GPIO35 — right
 
 // ---- LED state indication (v1.0.13) ----
 static const int kLedPin     = 5;       // GPIO5 = LED_BUILTIN on LOLIN32
@@ -64,8 +62,9 @@ bool   toneEnabled      = false;
 volatile bool btConnected = false;
 String lastBtState      = "idle";
 volatile int audioVolume = 80;
-bool   adcEnabled       = false;  // tracks whether i2s_adc_enable() has been called
-static esp_adc_cal_characteristics_t adcChars;  // calibration data loaded in setupADC()
+bool   adcEnabled       = false;  // tracks whether adc_continuous_start() has been called
+static adc_continuous_handle_t adcHandle = NULL;
+static adc_cali_handle_t adcCaliHandle = NULL;
 
 // v1.0.12: connection retry state
 int  macAttempts     = 0;
@@ -109,45 +108,45 @@ static inline int16_t ringPop() {
 static const int32_t kMidpointMv = 1650;
 
 void adcTask(void *) {
-  // I2S ADC built-in: each 16-bit word = [15:12] channel ID, [11:0] 12-bit value.
-  // SYSCON pattern table: written here (Core 1) once ADC is enabled, safely after BT init.
-  // A11: writing SYSCON before BT init (in setupADC) blocks the data callback — do it here.
-  static uint16_t tmp[256];
-  bool sysconApplied = false;
+  // adc_continuous output: each result is adc_digi_output_data_t (2 bytes on ESP32)
+  // type1 format: [15:12] channel, [11:0] 12-bit raw value
+  // Channel scan pattern alternates CH6(L) → CH7(R) → CH6(L) → CH7(R)...
+  static uint8_t buf[512];  // read buffer (256 results × 2 bytes each)
   while (true) {
-    // Apply SYSCON stereo pattern once, after i2s_adc_enable has been called
-    if (!sysconApplied && adcEnabled) {
-      SYSCON.saradc_ctrl.sar1_patt_len = 1;
-      SYSCON.saradc_sar1_patt_tab[0] = (0x6F << 24) | (0x7F << 16) | (0x6F << 8) | 0x7F;
-      sysconApplied = true;
-      // Step 22: flush ring so getDataFrames starts popping from clean L,R,L,R alignment.
-      // Without this, pre-SYSCON CH6-only samples cause misaligned (L,L) pairs.
-      ringWrite = 0; ringRead = 0;
-      Serial.println("[ADC] SYSCON stereo pattern applied (CH6=L, CH7=R), ring flushed");
+    if (!adcEnabled || adcHandle == NULL) {
+      vTaskDelay(pdMS_TO_TICKS(10));
+      continue;
     }
-    size_t bytes_read = 0;
-    i2s_read(kI2SPort, tmp, sizeof(tmp), &bytes_read, pdMS_TO_TICKS(10));
-    int n = bytes_read / sizeof(uint16_t);
+    uint32_t bytes_read = 0;
+    esp_err_t err = adc_continuous_read(adcHandle, buf, sizeof(buf), &bytes_read, 10);
+    if (err != ESP_OK) {
+      continue;
+    }
+    int n = bytes_read / sizeof(adc_digi_output_data_t);
+    adc_digi_output_data_t *results = (adc_digi_output_data_t *)buf;
+
     static uint32_t fillLCount = 0;
     static uint32_t fillRCount = 0;
     static uint32_t readCount  = 0;
     static uint32_t fillTick   = 0;
-    // Step 22: hold CH6 until CH7 arrives, then push the complete L+R pair together.
-    // Guarantees ring is always L,R,L,R aligned — no stray CH6-only samples between pairs.
+    // Hold CH6 until CH7 arrives, then push the complete L+R pair together.
     static int16_t pendingL    = 0;
     static bool    hasPendingL = false;
     readCount++;
     for (int i = 0; i < n; i++) {
-      uint8_t  chId = (tmp[i] >> 12) & 0xF;
-      // Step 26: use eFuse calibration instead of linear conversion (fixes ADC nonlinearity)
-      uint32_t mv   = esp_adc_cal_raw_to_voltage(tmp[i] & 0x0FFF, &adcChars);
-      int32_t  adc  = (int32_t)mv - kMidpointMv;
-      // Step 29 REVERTED — soft gate degraded music quality; ADC noise is hardware floor
-      if (chId == 6) {
+      uint8_t  chId = results[i].type1.channel;
+      uint16_t raw  = results[i].type1.data;
+      // eFuse calibration: convert raw → millivolts (corrects ADC nonlinearity)
+      int mv = 0;
+      if (adcCaliHandle) {
+        adc_cali_raw_to_voltage(adcCaliHandle, raw, &mv);
+      }
+      int32_t adc = (int32_t)mv - kMidpointMv;
+      if (chId == kAdcChannelL) {
         pendingL    = (int16_t)adc;
         hasPendingL = true;
         fillLCount++;
-      } else if (chId == 7 && hasPendingL) {
+      } else if (chId == kAdcChannelR && hasPendingL) {
         ringPush(pendingL);          // L first
         ringPush((int16_t)adc);      // R second
         hasPendingL = false;
@@ -157,13 +156,12 @@ void adcTask(void *) {
     uint32_t now = millis();
     if (now - fillTick >= 2000) {
       uint32_t lRate = fillLCount / 2, rRate = fillRCount / 2;
-      // Confirm stereo once R channel reaches ≥10% of L rate (SYSCON pattern working)
       if (!stereoActive && rRate > lRate / 10 && lRate > 0) {
         stereoActive = true;
         Serial.println("[ADC] Stereo confirmed — CH7 (GPIO35) active");
       }
 #ifdef DEBUG_STATS
-      Serial.printf("[v%s][ADC] L: %u/sec  R: %u/sec  reads: %u/sec  ringL: %d  ringR: %d  stereo: %s\n",
+      Serial.printf("[v%s][ADC] L: %u/sec  R: %u/sec  reads: %u/sec  ring: %d  stereo: %s\n",
                     kFwVersion, lRate, rRate, readCount / 2, ringAvail(), stereoActive ? "yes" : "no");
 #endif
       fillLCount = 0; fillRCount = 0; readCount = 0; fillTick = now;
@@ -262,10 +260,16 @@ int32_t getDataFrames(Frame *frame, int32_t frame_count) {
 // ---- BT state callback ----
 
 void enableADC() {
-  if (!adcEnabled) {
-    i2s_adc_enable(kI2SPort);
-    adcEnabled = true;
-    Serial.println("[ADC] I2S enabled");
+  if (!adcEnabled && adcHandle != NULL) {
+    esp_err_t err = adc_continuous_start(adcHandle);
+    if (err == ESP_OK) {
+      adcEnabled = true;
+      // Flush ring for clean L,R alignment on start
+      ringWrite = 0; ringRead = 0;
+      Serial.println("[ADC] continuous mode started");
+    } else {
+      Serial.printf("[ADC] start failed: %s\n", esp_err_to_name(err));
+    }
   }
 }
 
@@ -594,32 +598,49 @@ void updateLED() {
 
 // ---- Setup functions ----
 void setupADC() {
-  // Install I2S driver in setup() — safe with ONLY_LEFT format before BT init.
-  // (RIGHT_LEFT format caused BT crash loop — A8/A10. ONLY_LEFT is fine here.)
-  i2s_config_t cfg      = {};
-  cfg.mode              = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX | I2S_MODE_ADC_BUILT_IN);
-  cfg.sample_rate       = kI2SConfigRate;
-  cfg.bits_per_sample   = I2S_BITS_PER_SAMPLE_16BIT;
-  cfg.channel_format    = I2S_CHANNEL_FMT_ONLY_LEFT;  // mono-width; demux CH6/CH7 by channel ID
-  cfg.communication_format = I2S_COMM_FORMAT_STAND_I2S;
-  cfg.intr_alloc_flags  = ESP_INTR_FLAG_LEVEL1;
-  cfg.dma_desc_num      = 4;
-  cfg.dma_frame_num     = 256;
-  cfg.use_apll          = false;
+  // v1.0.14: adc_continuous API — replaces legacy I2S ADC built-in mode
+  // No more SYSCON register hacks — the API natively supports multi-channel scan
 
-  // Set input range to 0–3.3V so 1.65V bias is centred (default 0dB = 0–1.1V clips!)
-  adc1_config_width(ADC_WIDTH_BIT_12);
-  adc1_config_channel_atten(kAdcChannelL, ADC_ATTEN_DB_11);  // GPIO34 — left
-  adc1_config_channel_atten(kAdcChannelR, ADC_ATTEN_DB_11);  // GPIO35 — right
-  // Load per-chip eFuse calibration — corrects ADC nonlinearity
-  esp_adc_cal_characterize(ADC_UNIT_1, ADC_ATTEN_DB_11, ADC_WIDTH_BIT_12, 0, &adcChars);
+  // 1) Create handle
+  adc_continuous_handle_cfg_t hdl_cfg = {};
+  hdl_cfg.max_store_buf_size = 4096;
+  hdl_cfg.conv_frame_size    = 512;  // bytes per conversion frame
+  ESP_ERROR_CHECK(adc_continuous_new_handle(&hdl_cfg, &adcHandle));
 
-  i2s_driver_install(kI2SPort, &cfg, 0, NULL);
-  i2s_set_adc_mode(ADC_UNIT_1, kAdcChannelL);
-  // SYSCON pattern table is written from adcTask (Core 1) once i2s_adc_enable fires,
-  // NOT here — writing SYSCON before BT init appears to block the data callback.
-  // i2s_adc_enable() is called later in connectionStateChanged, AFTER BT connects.
-  Serial.println("[ADC] I2S configured (SYSCON stereo pattern applied from adcTask after enable)");
+  // 2) Configure scan pattern: CH6(L) → CH7(R) alternating
+  adc_digi_pattern_config_t pattern[2] = {};
+  pattern[0].atten     = ADC_ATTEN_DB_12;    // 0–3.3V range (was DB_11, now DB_12 in new API)
+  pattern[0].channel   = kAdcChannelL;        // CH6 = GPIO34
+  pattern[0].unit      = ADC_UNIT_1;
+  pattern[0].bit_width = ADC_BITWIDTH_12;
+  pattern[1].atten     = ADC_ATTEN_DB_12;
+  pattern[1].channel   = kAdcChannelR;        // CH7 = GPIO35
+  pattern[1].unit      = ADC_UNIT_1;
+  pattern[1].bit_width = ADC_BITWIDTH_12;
+
+  adc_continuous_config_t dig_cfg = {};
+  dig_cfg.pattern_num    = 2;
+  dig_cfg.adc_pattern    = pattern;
+  dig_cfg.sample_freq_hz = kAdcSampleRate;
+  dig_cfg.conv_mode      = ADC_CONV_SINGLE_UNIT_1;
+  dig_cfg.format         = ADC_DIGI_OUTPUT_FORMAT_TYPE1;
+  ESP_ERROR_CHECK(adc_continuous_config(adcHandle, &dig_cfg));
+
+  // 3) Setup eFuse calibration (new API)
+  adc_cali_line_fitting_config_t cali_cfg = {};
+  cali_cfg.unit_id  = ADC_UNIT_1;
+  cali_cfg.atten    = ADC_ATTEN_DB_12;
+  cali_cfg.bitwidth = ADC_BITWIDTH_12;
+  esp_err_t cali_err = adc_cali_create_scheme_line_fitting(&cali_cfg, &adcCaliHandle);
+  if (cali_err != ESP_OK) {
+    Serial.printf("[ADC] calibration init failed: %s (will use raw values)\n", esp_err_to_name(cali_err));
+    adcCaliHandle = NULL;
+  } else {
+    Serial.println("[ADC] eFuse calibration loaded");
+  }
+
+  // adc_continuous_start() is called later from enableADC()
+  Serial.println("[ADC] continuous mode configured (CH6=L, CH7=R)");
 
   xTaskCreatePinnedToCore(adcTask, "adc_task", 4096, NULL, 5, NULL, 1);
   Serial.println("[ADC] sampling task on Core 1");

@@ -40,7 +40,7 @@ All application logic in `src/main.cpp`. Library modifications in `.pio/libdeps/
 
 ### Audio path
 
-I2S ADC DMA → adcTask (SYSCON stereo CH6/CH7 alternation) → ring buffer → phase-accumulator stereo resampler → A2DP Bluetooth stack
+adc_continuous DMA (native CH6/CH7 alternating scan) → adcTask → ring buffer → phase-accumulator stereo resampler → A2DP Bluetooth stack
 
 ### Key callbacks
 
