@@ -13,7 +13,7 @@
 #include <nvs_flash.h>
 
 // ---- Firmware version ----
-static const char *kFwVersion = "1.0.11";
+static const char *kFwVersion = "1.0.13";
 
 // Uncomment to enable periodic ADC/A2DP stats on serial (every 2s)
 // #define DEBUG_STATS
@@ -29,11 +29,20 @@ static const uint32_t kI2SConfigRate = 53878;
 static const adc1_channel_t kAdcChannelL = ADC1_CHANNEL_6;  // GPIO34 — left
 static const adc1_channel_t kAdcChannelR = ADC1_CHANNEL_7;  // GPIO35 — right
 static const i2s_port_t kI2SPort        = I2S_NUM_0;
-static const int kAdcMidpoint           = 2048;
 
-// Reconnect backoff (ms)
-static const unsigned long kReconnectSteps[] = {2000, 4000, 8000, 20000, 60000, 120000};
-static const int kReconnectStepCount = 6;
+// ---- LED state indication (v1.0.13) ----
+static const int kLedPin     = 5;       // GPIO5 = LED_BUILTIN on LOLIN32
+static const int kLedFreq    = 5000;    // PWM frequency
+static const int kLedRes     = 8;       // 8-bit resolution (0-255)
+
+enum LedState { LED_OFF, LED_BREATHING, LED_SLOW_BLINK, LED_SOLID, LED_RAPID_BLINK };
+static LedState ledState = LED_OFF;
+static unsigned long ledRapidStart = 0;  // millis() when rapid blink started
+
+// v1.0.12: Fast reconnect — MAC first, then name scan, then give up
+static const int kMaxMacAttempts  = 3;   // ~7s each = ~21s max
+static const int kMaxNameAttempts = 2;   // ~18s each = ~36s max
+static const unsigned long kConnectTimeout = 15000;  // ms per attempt before giving up
 
 // ---- Ring buffers — left (CH6/GPIO34) and right (CH7/GPIO35) ----
 // Core 1 writes, Core 0 (BT callback) reads.
@@ -42,9 +51,6 @@ static int16_t  ringBuf[RING_SIZE];    // left channel
 static volatile int ringWrite = 0;
 static volatile int ringRead  = 0;
 
-static int16_t  ringBufR[RING_SIZE];   // right channel
-static volatile int ringWriteR = 0;
-static volatile int ringReadR  = 0;
 
 // ---- State ----
 BluetoothA2DPSource a2dp_source;
@@ -61,19 +67,20 @@ volatile int audioVolume = 80;
 bool   adcEnabled       = false;  // tracks whether i2s_adc_enable() has been called
 static esp_adc_cal_characteristics_t adcChars;  // calibration data loaded in setupADC()
 
-int  reconnectStepIdx = 0;
-bool reconnectPending = false;
-unsigned long reconnectAt = 0;
+// v1.0.12: connection retry state
+int  macAttempts     = 0;
+int  nameAttempts    = 0;
+bool connectingPhase = false;   // true while attempting to connect
+unsigned long connectStartedAt = 0;  // millis() when current attempt began
+bool wifiFallbackDone = false;  // true once we gave up and started WiFi
+bool bootHasSavedDevice = false; // true if we booted with a saved device (skip WiFi initially)
 
 // Stereo mode: true once right channel (CH7) is confirmed receiving samples from SYSCON pattern.
 // getDataFrames uses this to select stereo ratio (~0.5) vs mono ratio (~1.0).
 static volatile bool stereoActive = false;
 
-// DH5 auto-reconnect: if BT callbacks stuck at ~167/sec (DH5) for 10s, disconnect and
-// let auto_reconnect renegotiate — sometimes the new connection uses DH3 (335+/sec).
-static volatile bool triggerDH5Reconnect = false;
-static volatile int  dh5ReconnectCount   = 0;
-static const int     kMaxDH5Reconnects   = 5;  // give up after 5 attempts per session
+// DH5 reconnect disabled in v1.0.5 — esp_bt_sleep_disable() fixed the issue in v1.0.10
+static volatile bool resetResampler = false;  // v1.0.13: signal getDataFrames to reset state
 
 
 // ---- Ring buffer helpers — left ----
@@ -96,25 +103,6 @@ static inline int16_t ringPop() {
   return v;
 }
 
-// ---- Ring buffer helpers — right ----
-static inline int ringRAvail() {
-  int w = ringWriteR, r = ringReadR;
-  return (w >= r) ? (w - r) : (RING_SIZE - r + w);
-}
-
-static inline void ringRPush(int16_t v) {
-  int next = (ringWriteR + 1) % RING_SIZE;
-  if (next != ringReadR) {
-    ringBufR[ringWriteR] = v;
-    ringWriteR = next;
-  }
-}
-
-static inline int16_t ringRPop() {
-  int16_t v = ringBufR[ringReadR];
-  ringReadR = (ringReadR + 1) % RING_SIZE;
-  return v;
-}
 
 // ---- ADC sampling task — Core 1 ----
 // kMidpointMv: expected DC bias at ADC pin with 2×100kΩ divider on 3.3V = 1650 mV
@@ -176,7 +164,7 @@ void adcTask(void *) {
       }
 #ifdef DEBUG_STATS
       Serial.printf("[v%s][ADC] L: %u/sec  R: %u/sec  reads: %u/sec  ringL: %d  ringR: %d  stereo: %s\n",
-                    kFwVersion, lRate, rRate, readCount / 2, ringAvail(), ringRAvail(), stereoActive ? "yes" : "no");
+                    kFwVersion, lRate, rRate, readCount / 2, ringAvail(), stereoActive ? "yes" : "no");
 #endif
       fillLCount = 0; fillRCount = 0; readCount = 0; fillTick = now;
     }
@@ -187,7 +175,6 @@ void adcTask(void *) {
 // Step 21: single interleaved ring. adcTask pushes CH6(L) and CH7(R) both to ringBuf.
 // Ring contains: L, R, L, R, ... (SYSCON alternates CH6/CH7)
 // getDataFrames pops 2 per output frame: first = L (channel1), second = R (channel2).
-// No ringBufR access in BT task — avoids the A13 mystery crash.
 int32_t getDataFrames(Frame *frame, int32_t frame_count) {
   int vol = audioVolume;
   bool active = toneEnabled && btConnected;
@@ -208,6 +195,15 @@ int32_t getDataFrames(Frame *frame, int32_t frame_count) {
   static uint32_t drainCount = 0;  // output frames produced
   static uint32_t callCount  = 0;
   static uint32_t drainTick  = 0;
+
+  // v1.0.13: reset resampler on reconnect — stale ratio causes unstable audio
+  if (resetResampler) {
+    rsPrevL = rsCurrL = rsPrevR = rsCurrR = 0;
+    rsPhase = 0.0f;
+    kRatio = 0.515f;
+    drainCount = 0; callCount = 0; drainTick = millis();
+    resetResampler = false;
+  }
 
   callCount++;
   for (int i = 0; i < frame_count; i++) {
@@ -258,28 +254,12 @@ int32_t getDataFrames(Frame *frame, int32_t frame_count) {
                   callCount ? drainCount / callCount : 0, ringAvail(),
                   kRatio, (int)active);
 #endif
-    if (callCount > 0) {
-      static int dh5Streak = 0;
-      uint32_t callsPerSec = callCount / 2;
-      // DH5 reconnect disabled in v1.0.5 — some headsets only support DH5 (167/sec).
-      // Adaptive resampler handles the lower drain rate; reconnect loop was preventing playback.
-      if (callsPerSec >= 250) {
-        dh5ReconnectCount = 0;
-      }
-    }
     drainCount = 0; callCount = 0; drainTick = now;
   }
   return frame_count;
 }
 
 // ---- BT state callback ----
-void scheduleReconnect() {
-  unsigned long ms = kReconnectSteps[reconnectStepIdx];
-  if (reconnectStepIdx < kReconnectStepCount - 1) reconnectStepIdx++;
-  reconnectAt     = millis() + ms;
-  reconnectPending = true;
-  Serial.printf("[BT] next attempt in %lus\n", ms / 1000);
-}
 
 void enableADC() {
   if (!adcEnabled) {
@@ -310,27 +290,34 @@ void connectionStateChanged(esp_a2d_connection_state_t state, void *ptr) {
   Serial.printf("[A2DP] state: %s\n", lastBtState.c_str());
 
   if (state == ESP_A2D_CONNECTION_STATE_CONNECTED) {
-    // Always stop WiFi on connect — WiFi + BT together exhaust heap, SBC can't init
+    // v1.0.12: connection succeeded — stop retry tracking
+    connectingPhase = false;
+    macAttempts = 0;
+    nameAttempts = 0;
+
+    // Stop WiFi — WiFi + BT together exhaust heap, SBC can't init
     esp_wifi_stop();
 
     // v1.0.10: BT bandwidth tricks
-    // 1) Disable BT controller sleep — keep radio active for max throughput
     esp_err_t sleep_err = esp_bt_sleep_disable();
     Serial.printf("[BT] sleep_disable → %s\n", esp_err_to_name(sleep_err));
-
-    // 2) Stop being discoverable/connectable — free up scan slots for data
     esp_bt_gap_set_scan_mode(ESP_BT_NON_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
-    Serial.println("[BT] scan mode → non-connectable/non-discoverable");
 
-    // 3) Request DH3 packet type + enable EDR
     esp_bd_addr_t peer;
     memcpy(peer, a2dp_source.get_last_peer_address(), sizeof(esp_bd_addr_t));
-    esp_err_t pkt_err = esp_bt_gap_set_acl_pkt_types(peer,
+    esp_bt_gap_set_acl_pkt_types(peer,
         ESP_BT_ACL_PKT_TYPES_MASK_DH3 |
         ESP_BT_ACL_PKT_TYPES_MASK_DM3 |
         ESP_BT_ACL_PKT_TYPES_MASK_DM1 |
         ESP_BT_ACL_PKT_TYPES_MASK_DH1);
-    Serial.printf("[BT] set_acl_pkt_types → %s\n", esp_err_to_name(pkt_err));
+
+    // v1.0.12: save MAC for fast reconnect on next boot
+    // (library saves it too, but we log it for visibility)
+    Serial.printf("[BT] connected to MAC: %s\n", a2dp_source.to_str(peer));
+
+    // v1.0.13: flush ring + reset resampler on (re)connect — discard stale audio & ratio
+    ringWrite = 0; ringRead = 0;
+    resetResampler = true;
 
     toneEnabled = true;
     enableADC();
@@ -338,12 +325,14 @@ void connectionStateChanged(esp_a2d_connection_state_t state, void *ptr) {
   } else if (state == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
     toneEnabled = false;
     btConnected = false;
-    if (adcEnabled) {
-      i2s_adc_disable(kI2SPort);
-      adcEnabled = false;
-    }
-    esp_wifi_start();
-    Serial.println("[Audio] stopped, WiFi restarted");
+    // Don't disable ADC on disconnect — keep ring pre-filled for fast reconnect
+    // v1.0.13: rapid blink to alert user, then library auto-retries
+    ledState = LED_RAPID_BLINK;
+    ledRapidStart = millis();
+    connectingPhase = true;
+    connectStartedAt = millis();
+    macAttempts = 1;  // library retries by MAC automatically
+    Serial.println("[Audio] stopped, reconnecting...");
   }
 }
 
@@ -351,15 +340,23 @@ void startA2DP() {
   if (sourceStarted || targetDeviceName.isEmpty()) return;
   // v1.0.10: disable BT sleep before starting — maximize radio availability
   esp_bt_sleep_disable();
-  a2dp_source.set_auto_reconnect(true);  // library handles reconnects — no re-init
-  a2dp_source.set_volume(30);
+  a2dp_source.set_auto_reconnect(true);  // library caches MAC in NVS, reconnects by MAC (no scan)
+  // v1.0.13: don't override headset volume — let headset use its own remembered level
   a2dp_source.set_on_connection_state_changed(connectionStateChanged);
-  a2dp_source.set_on_audio_state_changed(audioStateChanged);  // fallback if conn event missed
+  a2dp_source.set_on_audio_state_changed(audioStateChanged);
   a2dp_source.set_data_callback_in_frames(getDataFrames);
   Serial.printf("[A2DP] starting -> %s\n", targetDeviceName.c_str());
   a2dp_source.start(targetDeviceName.c_str());
   sourceStarted = true;
-  lastBtState   = "starting";
+  lastBtState   = "connecting";
+  connectingPhase = true;
+  connectStartedAt = millis();
+  macAttempts = 1;  // first attempt is MAC-based (library auto-reconnect)
+
+  // v1.0.12: enable ADC immediately after BT stack init — pre-fill ring buffer
+  // so audio starts instantly when connection completes (no empty-ring silence gap)
+  enableADC();
+  Serial.println("[ADC] pre-filling ring buffer while BT connects");
 }
 
 // ---- HTML helpers ----
@@ -439,7 +436,7 @@ String renderPage() {
   page += F("<p class='muted' style='margin:0 0 8px'><b>Test audio</b> (embedded PCM chord, no ADC) — use to verify BT quality. WiFi stays up.<br><b>ADC input</b> — switches to live analog input. WiFi stops to reduce interference.</p>");
   page += F("</div>");
 
-  page += F("<div class='card'><h3>3) Volume</h3>");
+  page += F("<div class='card'><h3>3) Input Gain</h3>");
   page += F("<input type='range' id='vol' min='0' max='100' value='");
   page += String(audioVolume);
   page += F("'> <span id='volval'>");
@@ -544,6 +541,57 @@ void handleVolume() {
   server.send(200, "text/plain", "ok");
 }
 
+// ---- LED control ----
+void setupLED() {
+  ledcAttach(kLedPin, kLedFreq, kLedRes);
+  ledcWrite(kLedPin, 0);
+}
+
+void updateLED() {
+  uint32_t ms = millis();
+
+  // Determine state from flags
+  if (btConnected) {
+    ledState = LED_SOLID;
+  } else if (ledState == LED_RAPID_BLINK && (ms - ledRapidStart < 3000)) {
+    // Stay in rapid blink for 3 seconds (disconnect alert or final failure)
+  } else if (connectingPhase) {
+    ledState = LED_SLOW_BLINK;  // reconnecting
+  } else if (wifiFallbackDone || !bootHasSavedDevice) {
+    ledState = LED_BREATHING;   // AP mode
+  } else {
+    ledState = LED_OFF;
+  }
+
+  // LOLIN32 LED is active LOW: 0=full brightness, 255=off
+  switch (ledState) {
+    case LED_SOLID:
+      ledcWrite(kLedPin, 0);  // fully on
+      break;
+    case LED_BREATHING: {
+      // Smooth sine-wave breathing: ~3 second cycle
+      float phase = (float)(ms % 3000) / 3000.0f * 2.0f * 3.14159f;
+      uint8_t brightness = (uint8_t)((sinf(phase) + 1.0f) * 0.5f * 255.0f);
+      ledcWrite(kLedPin, 255 - brightness);  // invert for active LOW
+      break;
+    }
+    case LED_SLOW_BLINK: {
+      // ~1Hz blink: 500ms on, 500ms off
+      ledcWrite(kLedPin, (ms % 1000 < 500) ? 0 : 255);
+      break;
+    }
+    case LED_RAPID_BLINK: {
+      // 5Hz blink: 100ms on, 100ms off
+      ledcWrite(kLedPin, (ms % 200 < 100) ? 0 : 255);
+      break;
+    }
+    case LED_OFF:
+    default:
+      ledcWrite(kLedPin, 255);  // off
+      break;
+  }
+}
+
 // ---- Setup functions ----
 void setupADC() {
   // Install I2S driver in setup() — safe with ONLY_LEFT format before BT init.
@@ -622,39 +670,73 @@ void setup() {
                   targetDeviceName.c_str(), (int)audioVolume);
   }
 
+  setupLED();   // PWM LED for status indication
   setupADC();   // I2S driver + SYSCON stereo pattern + ADC task on Core 1
-  setupWeb();   // WiFi AP + HTTP server
 
-  if (!targetDeviceName.isEmpty()) {
-    startA2DP();  // auto-connect to last known device on boot
+  // v1.0.12: skip WiFi on boot if we have a saved device — saves heap for BT
+  // WiFi starts later if BT connection fails (fallback)
+  bootHasSavedDevice = !targetDeviceName.isEmpty();
+  if (bootHasSavedDevice) {
+    Serial.printf("[Boot] saved device '%s' — skipping WiFi, going straight to BT\n",
+                  targetDeviceName.c_str());
+    startA2DP();
+  } else {
+    setupWeb();
+    Serial.println("http://192.168.4.1  (ESP32-Audio-Setup / esp32audio)");
   }
-
-  Serial.println("http://192.168.4.1  (ESP32-Audio-Setup / esp32audio)");
 }
 
 void loop() {
-  dnsServer.processNextRequest();
-  server.handleClient();
-
-  // DH5 auto-reconnect: triggered from getDataFrames after 10s of choppy BT rate.
-  // Two-phase: disconnect() to close DH5 ACL, then reconnect() 3s later for fresh negotiation.
-  // NOTE: disconnect() sets is_autoreconnect_allowed=false — must call reconnect() manually.
-  static unsigned long dh5ReconnectPhase2At = 0;
-
-  if (triggerDH5Reconnect) {
-    triggerDH5Reconnect = false;
-    dh5ReconnectCount++;
-    Serial.printf("[BT] DH5 reconnect attempt %d/%d — disconnecting\n",
-                  (int)dh5ReconnectCount, kMaxDH5Reconnects);
-    a2dp_source.disconnect();
-    dh5ReconnectPhase2At = millis() + 3000;  // wait 3s for ACL teardown before reconnecting
+  // Only service web if WiFi is up
+  if (!bootHasSavedDevice || wifiFallbackDone) {
+    dnsServer.processNextRequest();
+    server.handleClient();
   }
 
-  if (dh5ReconnectPhase2At > 0 && millis() >= dh5ReconnectPhase2At) {
-    dh5ReconnectPhase2At = 0;
-    Serial.println("[BT] reconnecting after DH5 disconnect");
-    a2dp_source.reconnect();  // resets is_autoreconnect_allowed=true, tries fresh ACL
+  // v1.0.12: connection retry logic
+  // Library handles the actual BT connection/heartbeat internally.
+  // We monitor from here and track attempt counts for the MAC→name→WiFi fallback.
+  if (connectingPhase && !btConnected && sourceStarted) {
+    unsigned long elapsed = millis() - connectStartedAt;
+
+    // Check if current attempt has timed out
+    if (elapsed > kConnectTimeout) {
+      int totalMacAttempts = macAttempts;
+      int totalNameAttempts = nameAttempts;
+
+      if (totalMacAttempts < kMaxMacAttempts && totalNameAttempts == 0) {
+        // Still in MAC phase — library heartbeat will auto-retry
+        macAttempts++;
+        connectStartedAt = millis();
+        Serial.printf("[BT] MAC attempt %d/%d timed out, library retrying...\n",
+                      totalMacAttempts, kMaxMacAttempts);
+      } else if (totalMacAttempts >= kMaxMacAttempts && totalNameAttempts < kMaxNameAttempts) {
+        // MAC phase exhausted — switch to name scan
+        nameAttempts++;
+        connectStartedAt = millis();
+        Serial.printf("[BT] switching to name scan, attempt %d/%d\n",
+                      nameAttempts, kMaxNameAttempts);
+        // Disconnect and restart with name-based discovery
+        a2dp_source.disconnect();
+        delay(500);
+        // Clear library's cached MAC so it falls through to name scan
+        a2dp_source.clean_last_connection();
+        a2dp_source.reconnect();
+      } else {
+        // All attempts exhausted — rapid blink for 3s, then start WiFi
+        connectingPhase = false;
+        ledState = LED_RAPID_BLINK;
+        ledRapidStart = millis();
+        Serial.println("[BT] all connection attempts failed — starting WiFi AP");
+        if (!wifiFallbackDone) {
+          setupWeb();
+          wifiFallbackDone = true;
+          Serial.println("http://192.168.4.1  (ESP32-Audio-Setup / esp32audio)");
+        }
+      }
+    }
   }
 
+  updateLED();
   delay(10);
 }

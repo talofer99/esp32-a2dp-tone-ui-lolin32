@@ -4,55 +4,92 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Phase 1 proof-of-concept Bluetooth A2DP audio transmitter running on a WEMOS LOLIN32 (original ESP32 with Bluetooth Classic). Creates a Wi-Fi AP and serves a web UI to connect to Bluetooth headsets and play a sine-wave test tone.
+Bluetooth A2DP stereo audio transmitter running on a WEMOS LOLIN32 (original ESP32 with Bluetooth Classic). Reads stereo RCA analog input via ADC and streams to Bluetooth headsets/speakers. Wi-Fi AP web UI for device connection and control.
 
 **Target hardware:** Original ESP32 only — not ESP32-S3 (no Bluetooth Classic on S3).
 
 ## Build & Upload
 
-This is a PlatformIO/Arduino project. Open in VS Code with the PlatformIO extension installed.
+PlatformIO/Arduino project. Open in VS Code with PlatformIO extension.
 
-- **Build:** PlatformIO sidebar → `lolin32` environment → Build
-- **Upload:** PlatformIO sidebar → Upload (or `pio run -t upload`)
-- **Serial monitor:** 115200 baud (`pio device monitor`)
+- **Build:** `pio run`
+- **Upload:** `pio run -t upload --upload-port COMx`
+- **Serial monitor:** `python tools/monitor.py COMx 115200` → logs to `docs/logs/live.log`
 - **Upload speed:** 921600 baud
+- **Kill monitor before upload:** `powershell -Command "Get-Process python | Stop-Process -Force"`
 
-Key dependency pinned in [platformio.ini](platformio.ini): `pschatzmann/ESP32-A2DP @ ^1.8.9`
+Key dependency pinned in `platformio.ini`: `pschatzmann/ESP32-A2DP @ ^1.8.9`
 
 ## Architecture
 
-All application logic lives in a single file: [src/main.cpp](src/main.cpp)
+All application logic in `src/main.cpp`. Library modifications in `.pio/libdeps/lolin32/ESP32-A2DP/src/BluetoothA2DPSource.cpp`.
 
-### Two concurrent contexts
+### Hardware pins
 
-1. **Arduino main loop** (`loop()`) — polls `server.handleClient()` every 10ms to serve HTTP requests.
-2. **A2DP library thread** — ESP32-A2DP runs its own FreeRTOS tasks; communicates back via two registered callbacks.
+| Pin | Function |
+|-----|----------|
+| GPIO34 | ADC1_CH6 — Left audio input |
+| GPIO35 | ADC1_CH7 — Right audio input |
+| GPIO5 | LED_BUILTIN — status LED (active HIGH) |
 
-### Callbacks (cross-thread communication)
+### Concurrent contexts
 
-- `getDataFrames(Frame*, int32_t)` — called by the A2DP library requesting audio samples. Generates sine-wave frames via phase accumulation if `toneEnabled && btConnected`.
-- `connectionStateChanged(esp_a2d_connection_state_t, void*)` — updates `btConnected` and `lastBtState` (both `volatile`/global).
+1. **Arduino main loop** (`loop()`) — HTTP server polling + LED state machine + BT retry logic
+2. **A2DP library thread** — FreeRTOS tasks; audio callback `getDataFrames()` runs on Core 0
+3. **ADC task** (`adcTask`) — pinned to Core 1; reads I2S ADC DMA, pushes stereo pairs to ring buffer
 
-### Web UI flow
+### Audio path
 
-- `GET /` — renders inline HTML status page with current state.
-- `GET /connect?name=<device>` — sets `targetDeviceName`, calls `a2dp_source.start()` (one-time; requires reboot to change device).
-- `GET /tone/on` and `/tone/off` — toggle `toneEnabled`.
-- `htmlEscape()` sanitizes user input before embedding in HTML output.
+I2S ADC DMA → adcTask (SYSCON stereo CH6/CH7 alternation) → ring buffer → phase-accumulator stereo resampler → A2DP Bluetooth stack
 
-### Tone generation
+### Key callbacks
 
-Phase-accumulation sine wave at 523.25 Hz (C5), 44100 Hz sample rate, amplitude 9000, output as stereo `int16_t` frames (both channels identical).
+- `getDataFrames(Frame*, int32_t)` — stereo resampler with adaptive ratio, pops L/R pairs from ring
+- `connectionStateChanged()` — manages WiFi/ADC lifecycle, BT bandwidth tricks (sleep_disable, DH3 packets)
+- `audioStateChanged()` — fallback connection detection
 
-## Usage (after flashing)
+### Boot flow (v1.0.12+)
 
-1. Join Wi-Fi `ESP32-Audio-Setup` / password `esp32audio`
-2. Browse to `http://192.168.4.1`
+- **With saved device:** Skip WiFi → BT stack init → MAC reconnect (no name scan) → ADC pre-fills ring → connected in ~5s
+- **No saved device:** Start WiFi AP → wait for user → name scan → connect
+- **Retry logic:** 3 MAC attempts → 2 name scans → give up → start WiFi AP as fallback
+
+### Web UI
+
+- `GET /` — status page with auto-refresh (JS polling every 3s)
+- `GET /connect?name=<device>` — start BT connection
+- `GET /forget` — clear saved device, reboot
+- `GET /fullreset` — erase NVS (BT bonds + settings), reboot
+- `GET /volume?level=N` — set input gain 0-100 (digital PCM scaling), persisted to NVS
+- `GET /status` — JSON status endpoint for polling
+
+### LED state indication (v1.0.13)
+
+| State | Pattern |
+|-------|---------|
+| AP mode (waiting for user) | Breathing (smooth fade in/out) |
+| Connecting to BT | Slow blink (~1Hz) |
+| Connected + streaming | Solid ON |
+| Disconnect / connection failed | Rapid blink (5Hz) for 3s, then slow blink (reconnecting) or breathing (AP fallback) |
+
+## Library Modifications
+
+`.pio/libdeps/lolin32/ESP32-A2DP/src/BluetoothA2DPSource.cpp`:
+- `delay_ms(10000)` → `delay_ms(2000)` — faster BT stack settle
+- Heartbeat timer 10s → 3s — faster reconnect retries
+- AVRC volume handler fix — prevents reboot on headset volume change
+
+## Documentation Rules
+
+- **ALWAYS** update `docs/PROGRESS.md` with 🔲 TESTING BEFORE implementing changes
+- **ALWAYS** update with ✅/❌ result AFTER testing
+- Update `docs/ROADMAP.md` when completing or adding tasks
+- Bump `kFwVersion` in main.cpp for every firmware change
+
+## Usage
+
+1. Join Wi-Fi **ESP32-Audio-Setup** / password **esp32audio**
+2. Browse to **http://192.168.4.1**
 3. Put headset in pairing mode, enter exact Bluetooth device name, click **Connect**
-4. Click **Play tone** once connected
-
-## Known Limitations / Planned Work
-
-- No Bluetooth device scan — must know exact device name
-- No reconnect manager — reboot to change target device
-- Analog (RCA) input not yet implemented — planned for next iteration
+4. Audio streams automatically once connected
+5. On subsequent boots, connects automatically via cached MAC (~5s)

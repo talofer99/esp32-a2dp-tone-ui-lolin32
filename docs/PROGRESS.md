@@ -253,6 +253,55 @@ RCA shield → GND
 | `docs/ROADMAP.md` | Planned features and backlog |
 | `docs/PROGRESS.md` | This file |
 
+## Step 37 — Faster BT connection + reduce audio delay (v1.0.12) ✅ CONFIRMED
+
+**Problem:** Boot-to-sound takes ~15s+. Three bottlenecks:
+1. Library has a hardcoded `delay_ms(10000)` before attempting connection (line 530 of BluetoothA2DPSource.cpp)
+2. Heartbeat timer is 10s — retries are slow
+3. ADC/SYSCON only enabled AFTER BT connects — ring empty when first audio callback fires
+
+**Fix — three changes:**
+1. **Reduce library delay** from 10s → 2s (in BluetoothA2DPSource.cpp line 530)
+2. **Reduce heartbeat timer** from 10s → 3s (faster retries)
+3. **Custom retry logic in main.cpp:**
+   - Boot with saved device: library auto-reconnects by cached MAC (no name scan)
+   - Monitor connection state with timeout
+   - 3 MAC attempts (~7s each = ~21s max)
+   - If MAC fails: 2 name scan attempts (~18s each = ~36s max)
+   - If ALL fail: stop BT, start WiFi AP for user access
+4. **Pre-fill ring buffer:** enable ADC right after `a2dp_source.start()` (BT stack initialized) instead of waiting for CONNECTED callback
+5. **No WiFi on auto-reconnect boot** — skip AP if we have a saved device (save heap for BT)
+
+**Watch out for:**
+- Bug A11: SYSCON before BT init blocked callbacks — but we enable AFTER `start()` which inits BT, so should be safe
+- MAC can go stale if headset factory-reset — name scan fallback covers this
+- If all retries fail and WiFi never starts, user is locked out — WiFi fallback is critical
+
+**Result:** Boot-to-sound ~5-6 seconds (was 15-20+). MAC reconnect skips name scan entirely. Ring pre-filled so no silence gap on connect. WiFi fallback works after all retries exhausted. User confirmed: "connection MUCH faster, music starts!"
+**Version:** v1.0.12
+
+---
+
+## Step 38 — LED state indication (v1.0.13) ✅ CONFIRMED
+
+**Goal:** Use onboard LED (GPIO5) to show device state at a glance.
+
+**LED patterns:**
+| State | Pattern | Description |
+|-------|---------|-------------|
+| AP mode (no saved device or all retries failed) | Breathing (smooth fade in/out) | WiFi AP is active, waiting for user |
+| Booting / connecting to BT | Slow blink (~1Hz) | Attempting to connect to saved device |
+| Connected + streaming | Solid ON | Everything working |
+| Disconnect / connection failed | Rapid blink (5Hz) for 3 seconds | Visual alert, then slow blink (reconnecting) or breathing (AP fallback) |
+
+**Implementation:** LEDC PWM on GPIO5 for smooth breathing. LED is active LOW on LOLIN32 (0=full on, 255=off). State machine in `updateLED()` called from `loop()`.
+
+**Result:** All 4 states working. Disconnect triggers rapid blink → slow blink → reconnects → solid. User confirmed: "great!"
+
+**Version:** v1.0.13
+
+---
+
 ## How to Start Monitor
 ```
 python tools/monitor.py COM6 115200

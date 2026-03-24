@@ -11,9 +11,10 @@ Wi-Fi AP web UI for device connection and control — no app needed.
 - A2DP source streaming to any Bluetooth Classic headset/speaker
 - Phase-accumulator resampler with adaptive ratio
 - eFuse ADC calibration for linearity correction
-- Auto-reconnect to last paired device on boot
-- Volume control via web UI (persisted to NVS)
+- Fast auto-reconnect via cached MAC (~5s boot-to-sound)
+- Input gain slider via web UI (persisted to NVS) — use headset buttons for actual volume
 - "Forget device" button to clear BT pairing
+- LED status indicator: breathing=AP, slow blink=connecting, solid=streaming, rapid blink=disconnect
 - Debug stats toggle (`#define DEBUG_STATS` in main.cpp)
 
 ## Hardware
@@ -25,6 +26,7 @@ Wi-Fi AP web UI for device connection and control — no app needed.
 | Right input | GPIO35 (ADC1_CH7) |
 | Bias circuit | 2×100K divider (3.3V→GPIO→GND) + 22µF coupling cap + 10K series resistor |
 | Filter caps | 1nF ceramic low-pass + 10µF electrolytic bias bypass per channel |
+| Status LED | GPIO5 (onboard) — breathing/blink/solid indicates device state |
 
 **Note:** Must be original ESP32 — ESP32-S3 has no Bluetooth Classic.
 

@@ -30,17 +30,20 @@
 
 ### Priority — Next up
 
-- [ ] **LED state indication** — use onboard or external LED to show current state (booting, waiting for BT, connecting, streaming, error)
-- [ ] **Faster BT connection** — investigate reducing discovery timeout, caching device address, or skipping name resolution for known devices
-- [ ] **Reduce connection-to-audio delay** — minimize time between BT connected and first audio frame (pre-fill ring buffer, faster SYSCON apply)
-- [ ] **Web UI keep-alive** — add JS polling or WebSocket so the status page stays updated without manual refresh; handle WiFi→BT transition gracefully
+- [x] **LED state indication** — onboard LED (GPIO5): breathing=AP mode, slow blink=connecting, solid=streaming, rapid blink=disconnect/failure alert (v1.0.13)
+- [x] **Faster BT connection** — library delay 10s→2s, heartbeat 10s→3s, MAC-based reconnect skips name scan (v1.0.12)
+- [x] **Reduce connection-to-audio delay** — ADC pre-fills ring buffer during BT connect, no silence gap on first audio frame (v1.0.12)
+- [ ] **Keep WiFi AP alive during BT streaming** — currently `esp_wifi_stop()` kills the web UI on BT connect; investigate running both concurrently (heap permitting) so user can adjust volume/disconnect from the UI
 - [ ] **Physical clear button** — hardware button (GPIO) to clear NVS and reset BT pairing without needing WiFi/web UI access
 
 ### UX improvements
 
+- [x] **Save last volume level** — already persisted to NVS on change + restored on boot (was already implemented)
+- [x] **Better volume control** — removed hardcoded `set_volume(30)`, renamed slider to "Input Gain" to clarify it's digital gain not headset volume. Use headset buttons for actual volume (v1.0.13)
 - [ ] **Bluetooth device scan** — use `a2dp_source.discover_async()` to scan for nearby Classic BT devices and show a tap-to-connect list
-- [ ] **Auto-start audio** — start streaming automatically when BT connects (skip manual button)
-- [ ] **Status auto-refresh** — small JS polling so the status card updates without manual reload
+- [ ] **Re-evaluate web UI content** — review what info is shown, layout, and usefulness; simplify or reorganize as needed
+- [x] **Auto-start audio** — streaming starts automatically on BT connect (`toneEnabled = true` in connectionStateChanged)
+- [x] **Status auto-refresh** — JS polling every 3s via `setInterval(refresh, 3000)` + `/status` endpoint
 
 ### Audio quality
 
