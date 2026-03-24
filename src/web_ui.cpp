@@ -211,4 +211,5 @@ void setupWeb() {
   server.onNotFound(handleRedirect);
 
   server.begin();
+  Serial.println("http://192.168.4.1  (ESP32-Audio-Setup / esp32audio)");
 }

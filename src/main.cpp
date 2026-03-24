@@ -55,7 +55,6 @@ void setup() {
     startA2DP();
   } else {
     setupWeb();
-    Serial.println("http://192.168.4.1  (ESP32-Audio-Setup / esp32audio)");
   }
 }
 
