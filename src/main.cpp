@@ -94,7 +94,6 @@ void loop() {
         if (!wifiFallbackDone) {
           setupWeb();
           wifiFallbackDone = true;
-          Serial.println("http://192.168.4.1  (ESP32-Audio-Setup / esp32audio)");
         }
       }
     }
